@@ -14,47 +14,23 @@ from utils.noise import DelayOUNoise
 from algorithms.maddpg import MADDPG
 from tqdm import tqdm 
 
-USE_CUDA = False  # torch.cuda.is_available()
+# FIXED: Proper CUDA detection and initialization
+def setup_cuda():
+    """Setup CUDA with proper device selection for Colab"""
+    if torch.cuda.is_available():
+        # In Colab, GPU 0 is the default
+        device_id = 0
+        torch.cuda.set_device(device_id)
+        print(f"CUDA available: {torch.cuda.get_device_name(device_id)}")
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"Device count: {torch.cuda.device_count()}")
+        print(f"Current device: {torch.cuda.current_device()}")
+        return True
+    else:
+        print("✗ CUDA not available, using CPU")
+        return False
 
-# Force CUDA initialization early
-if torch.cuda.is_available():
-    torch.cuda.init()
-    print(f" CUDA initialized: {torch.cuda.get_device_name(0)}")
-else:
-    print(" No CUDA available, using CPU")
-import os
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
-
-
-class OUNoise:
-    """Ornstein-Uhlenbeck process for generating temporally correlated noise."""
-    def __init__(self, mu=0.0, theta=0.15, sigma=0.2, dt=1.0, x0=None):
-        """
-        Args:
-            mu: Mean/equilibrium value
-            theta: Mean reversion rate (higher = faster return to mean)
-            sigma: Volatility/noise scale
-            dt: Time step
-            x0: Initial value (defaults to mu)
-        """
-        self.mu = mu
-        self.theta = theta
-        self.sigma = sigma
-        self.dt = dt
-        self.x0 = x0 if x0 is not None else mu
-        self.reset()
-    
-    def reset(self):
-        """Reset the process to initial state."""
-        self.x = self.x0
-    
-    def sample(self):
-        """Generate next sample from the OU process."""
-        dx = self.theta * (self.mu - self.x) * self.dt + \
-             self.sigma * np.sqrt(self.dt) * np.random.randn()
-        self.x = self.x + dx
-        return self.x
-
+USE_CUDA = setup_cuda()
 
 def make_parallel_env(env_id, n_rollout_threads, seed, discrete_action):
     def get_env_fn(rank):
@@ -130,23 +106,24 @@ def run(config):
     print("TRAINING CONFIGURATION")
     print("="*60)
     print(f"Environment: {config.env_id}")
+    print(f"Device: {'CUDA (GPU)' if USE_CUDA else 'CPU'}")
     print(f"Min delay: {config.min_delay}")
     print(f"Max delay: {config.max_delay}")
     print(f"OU theta: {config.ou_theta}")
     print(f"OU sigma: {config.ou_sigma}")
     print(f"Episodes: {config.n_episodes}")
     print(f"Episode length: {config.episode_length}")
+    print(f"Exploration episodes: {config.n_exploration_eps}")
     print(f"Learning rate: {config.lr}")
+    print(f"Gamma: {config.gamma}")
     print(f"Hidden dim: {config.hidden_dim}")
     print(f"Batch size: {config.batch_size}")
+    print(f"Rollout threads: {config.n_rollout_threads}")
     print("="*60 + "\n")
-    print("\n[DEBUG] ========== INITIALIZING MADDPG ==========")
     
     # Calculate buffer size needed based on max_delay
     delay_buffer_size = int(np.ceil(config.max_delay)) + 1
-    
-    # Calculate buffer size needed based on max_delay (BEFORE MADDPG init)
-    delay_buffer_size = int(np.ceil(config.max_delay)) + 1
+    print(f"[INFO] Delay buffer size: {delay_buffer_size}")
     
     maddpg = MADDPG.init_from_env_with_delay(
         env, 
@@ -155,6 +132,7 @@ def run(config):
         tau=config.tau,
         lr=config.lr,
         hidden_dim=config.hidden_dim,
+        gamma=config.gamma,
         min_delay=config.min_delay,
         max_delay=config.max_delay,
         use_sigmoid=True
@@ -166,7 +144,7 @@ def run(config):
     ou_processes = []
     for env_idx in range(config.n_rollout_threads):
         env_ou_list = []
-        for agent_idx in range(maddpg.nagents):  # Now we know nagents
+        for agent_idx in range(maddpg.nagents):
             ou = OUNoise(
                 mu=delay_mean,
                 theta=config.ou_theta,
@@ -177,8 +155,7 @@ def run(config):
         ou_processes.append(env_ou_list)
     
     for i, agent in enumerate(maddpg.agents):
-        print(f"[INFO] Agent {i} policy input dim: {agent.policy.in_fn.num_features}")
-        print(f"[INFO] Agent {i} max delay_step: {config.max_delay}")
+        print(f"[INFO] Agent {i} policy input dim: {agent.policy.fc1.in_features}")
     
     # Calculate observation dimension for replay buffer
     replay_buffer = ReplayBuffer(
@@ -200,6 +177,7 @@ def run(config):
     for ep_i in pbar:
         obs = env.reset()
         
+        # FIXED: Proper device switching
         if USE_CUDA:
             maddpg.prep_rollouts(device='gpu')
         else:
@@ -239,6 +217,10 @@ def run(config):
             torch_obs = [Variable(torch.Tensor(np.vstack(obs[:, i])),
                                   requires_grad=False)
                          for i in range(maddpg.nagents)]
+            
+            # FIXED: Move observations to GPU if using CUDA
+            if USE_CUDA:
+                torch_obs = [obs.cuda() for obs in torch_obs]
             
             # Get actions from policies
             torch_agent_actions = maddpg.step(torch_obs, explore=True)
@@ -298,7 +280,7 @@ def run(config):
                         agent_obs = np.append(agent_obs, last_agent_actions[env_idx][a_i][action_idx])
                     next_obs[env_idx, a_i] = agent_obs
             
-            # After you compute virtual actions for all agents
+            # FIXED: Collect virtual actions and push ONCE (removed duplicate)
             virtual_actions_per_agent = []
             for agent_idx in range(maddpg.nagents):
                 # Collect virtual actions across all parallel environments
@@ -306,10 +288,8 @@ def run(config):
                                                 for env_idx in range(config.n_rollout_threads)])
                 virtual_actions_per_agent.append(agent_virtual_actions)
 
-            # Store virtual actions (what actually executed)
+            # Store virtual actions (what actually executed) - ONLY ONCE!
             replay_buffer.push(obs, virtual_actions_per_agent, rewards, next_obs, dones)
-
-            replay_buffer.push(obs, agent_actions, rewards, next_obs, dones)
             
             obs = next_obs
             t += config.n_rollout_threads
@@ -320,12 +300,17 @@ def run(config):
                     maddpg.prep_training(device='gpu')
                 else:
                     maddpg.prep_training(device='cpu')
-                # for u_i in range(config.n_rollout_threads):
-                sample = replay_buffer.sample(config.batch_size,
-                                                    to_gpu=USE_CUDA)
-                for a_i in range(maddpg.nagents - 1):  # do not update the runner
+                
+                # Sample once, use for all agents
+                sample = replay_buffer.sample(config.batch_size, to_gpu=USE_CUDA)
+                
+                # Update all agents (excluding runner if nagents > 3)
+                for a_i in range(maddpg.nagents):
                     maddpg.update(sample, a_i, logger=logger)
+                
+                # Update all target networks
                 maddpg.update_all_targets()
+                
                 if USE_CUDA:
                     maddpg.prep_rollouts(device='gpu')
                 else:
@@ -385,22 +370,23 @@ if __name__ == '__main__':
     parser.add_argument("--seed",
                         default=1, type=int,
                         help="Random seed")
-    parser.add_argument("--n_rollout_threads", default=1, type=int)
+    parser.add_argument("--n_rollout_threads", default=12, type=int)
     parser.add_argument("--n_training_threads", default=6, type=int)
     parser.add_argument("--buffer_length", default=int(1e6), type=int)
-    parser.add_argument("--n_episodes", default=25000, type=int)
-    parser.add_argument("--episode_length", default=25, type=int)
+    parser.add_argument("--n_episodes", default=40000, type=int)
+    parser.add_argument("--episode_length", default=100, type=int)
     parser.add_argument("--steps_per_update", default=100, type=int)
     parser.add_argument("--batch_size",
                         default=1024, type=int,
                         help="Batch size for model training")
-    parser.add_argument("--n_exploration_eps", default=3000, type=int)
+    parser.add_argument("--n_exploration_eps", default=12000, type=int)
     parser.add_argument("--init_noise_scale", default=0.3, type=float)
     parser.add_argument("--final_noise_scale", default=0.0, type=float)
     parser.add_argument("--save_interval", default=1000, type=int)
-    parser.add_argument("--hidden_dim", default=64, type=int)
-    parser.add_argument("--lr", default=0.01, type=float)
+    parser.add_argument("--hidden_dim", default=256, type=int)
+    parser.add_argument("--lr", default=0.0001, type=float)
     parser.add_argument("--tau", default=0.01, type=float)
+    parser.add_argument("--gamma", default=0.95, type=float)
     parser.add_argument("--agent_alg",
                         default="MADDPG", type=str,
                         choices=['MADDPG', 'DDPG'])

@@ -15,16 +15,12 @@ class MultiAgentEnvAdapter:
         obs_dict, _ = self.env.reset()
         self.agents = list(obs_dict.keys())
         self.n = len(self.agents)
-        # print(f"[DEBUG] Agents: {self.agents}, Total: {self.n}")
+        # Get agent types for MADDPG initialization
+        self.agent_types = ['agent'] * len(self.agents)  # All cooperative in simple_spread
+        
     def reset(self, **kwargs):
         obs_dict, _ = self.env.reset(**kwargs)
         obs_n = [obs_dict[a] for a in self.agents]
-        
-        # ADD THESE DEBUG PRINTS HERE:
-        # print(f"[DEBUG] obs_n types: {[type(o) for o in obs_n]}")
-        # print(f"[DEBUG] obs_n shapes: {[o.shape if hasattr(o, 'shape') else 'no shape' for o in obs_n]}")
-        # print(f"[DEBUG] obs_n dtypes: {[o.dtype if hasattr(o, 'dtype') else 'no dtype' for o in obs_n]}")
-        
         return obs_n
 
     def step(self, action_n):
@@ -32,15 +28,7 @@ class MultiAgentEnvAdapter:
         action_n: list of actions for each agent in self.agents order
         Returns: obs_n, reward_n, done_n, info_n
         """
-        # map list -> dict for PettingZoo env
-        for i, act in enumerate(action_n):
-            # print(f"[DEBUG] Agent {i} action type: {type(act)}, dtype: {act.dtype if hasattr(act, 'dtype') else 'N/A'}")
-            # print(f"[DEBUG] Agent {i} action: {act}, min: {act.min()}, max: {act.max()}")
-            
-            # Verify bounds
-            if hasattr(act, 'min') and hasattr(act, 'max'):
-                if act.min() < 0 or act.max() > 1:
-                    print(f"[ERROR] Agent {i} action OUT OF BOUNDS!")
+        # Convert list to dict for PettingZoo env
         actions = {a: act for a, act in zip(self.agents, action_n)}
         obs_dict, rewards_dict, terminations, truncations, infos_dict = self.env.step(actions)
 
@@ -52,6 +40,7 @@ class MultiAgentEnvAdapter:
         return obs_n, reward_n, done_n, info_n
 
     def render(self):
+        """Render the environment with fixed camera bounds"""
         frame = self.env.render()
         if hasattr(self.env.unwrapped, "viewer") and self.env.unwrapped.viewer is not None:
             viewer = self.env.unwrapped.viewer
@@ -70,21 +59,27 @@ class MultiAgentEnvAdapter:
 
     @property
     def action_space(self):
-        spaces = [self.env.action_space(a) for a in self.agents]
-        for i, sp in enumerate(spaces):
-            # print(f"[DEBUG] Agent {self.agents[i]} Action space: {sp}, Type: {type(sp)}")
-            pass
-        return spaces
+        return [self.env.action_space(a) for a in self.agents]
+    
     @property
     def observation_space(self):
-        spaces = [self.env.observation_space(a) for a in self.agents]
-        for i, sp in enumerate(spaces):
-            # print(f"[DEBUG] Agent {self.agents[i]} Observation space: {sp}, Type: {type(sp)}")
-            pass
-        return spaces
+        return [self.env.observation_space(a) for a in self.agents]
 
 
-def make_env(scenario_name, discrete_action=False, render_mode=None, **env_kwargs):
+def make_env(scenario_name, discrete_action=False, render_mode=None, max_cycles=100, **env_kwargs):
+    """
+    Create a multi-agent environment from PettingZoo MPE.
+    
+    Args:
+        scenario_name: Name of the scenario (e.g., 'simple_spread')
+        discrete_action: Whether to use discrete actions (default: False for continuous)
+        render_mode: Rendering mode ('human', 'rgb_array', or None)
+        max_cycles: Maximum number of cycles per episode (default: 100)
+        **env_kwargs: Additional environment parameters
+    
+    Returns:
+        MultiAgentEnvAdapter wrapping the PettingZoo environment
+    """
     scenario_dict = {
         'simple_speaker_listener': ssl_env,
         'simple_spread': ss_env,
@@ -92,39 +87,51 @@ def make_env(scenario_name, discrete_action=False, render_mode=None, **env_kwarg
         'simple_tag': st_env,
         'simple_push': sp_env,
     }
-    if scenario_name not in scenario_dict:
-        raise ValueError(f"Scenario {scenario_name} not found in MPE2 environments")
     
+    if scenario_name not in scenario_dict:
+        raise ValueError(f"Scenario {scenario_name} not found. Available: {list(scenario_dict.keys())}")
+    
+    # Build environment parameters
     env_params = {
-        'max_cycles': env_kwargs.pop('max_cycles', 25),
+        'max_cycles': max_cycles,  # CRITICAL: Must match episode_length in training
         'continuous_actions': not discrete_action,
         'render_mode': render_mode
     }
     env_params.update(env_kwargs)
     
-    print(f"\n[MAKE_ENV DEBUG] Creating {scenario_name} with params:")
-    print(f"  continuous_actions: {env_params['continuous_actions']}")
-    print(f"  max_cycles: {env_params['max_cycles']}")
-    print(f"  extra_params: {env_kwargs}")
+    print(f"\n{'='*60}")
+    print(f"CREATING ENVIRONMENT: {scenario_name}")
+    print(f"{'='*60}")
+    print(f"  Continuous actions: {env_params['continuous_actions']}")
+    print(f"  Max cycles: {env_params['max_cycles']}")
+    if env_kwargs:
+        print(f"  Additional params: {env_kwargs}")
     
+    # Create PettingZoo environment
     env = scenario_dict[scenario_name](**env_params)
     
-    # Check the raw environment before adapter
-    print(f"\n[MAKE_ENV DEBUG] Raw PettingZoo environment created")
+    # Inspect the raw environment
     obs_dict, _ = env.reset()
-    print(f"  Agents: {list(obs_dict.keys())}")
+    print(f"\n  Number of agents: {len(obs_dict)}")
+    print(f"  Agent names: {list(obs_dict.keys())}")
+    
     for agent_name in obs_dict.keys():
         obs_shape = obs_dict[agent_name].shape
         action_space = env.action_space(agent_name)
         obs_space = env.observation_space(agent_name)
-        print(f"  {agent_name}:")
-        print(f"    Observation shape: {obs_shape}")
-        print(f"    Observation space: {obs_space}")
-        print(f"    Action space: {action_space}")
+        
+        print(f"\n  {agent_name}:")
+        print(f"    Obs space: {obs_space} (shape: {obs_shape})")
+        print(f"    Act space: {action_space}", end="")
         if hasattr(action_space, 'shape'):
-            print(f"    Action shape: {action_space.shape}")
+            print(f" (shape: {action_space.shape})")
         elif hasattr(action_space, 'n'):
-            print(f"    Action n (discrete): {action_space.n}")
+            print(f" (n: {action_space.n})")
+        else:
+            print()
     
+    print(f"{'='*60}\n")
+    
+    # Wrap in adapter
     env = MultiAgentEnvAdapter(env)
     return env

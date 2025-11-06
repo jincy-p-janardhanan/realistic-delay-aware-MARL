@@ -13,7 +13,7 @@ azure-nspkg==3.0.2
 azure-servicebus==0.20.1
 azure-servicemanagement-legacy==0.20.2
 azure-storage==0.20.3
--e git+https://github.com/22b1074/delay-aware-MARL-master.git@90c7fdc563f5d292aa8d7a69539b13ec45573f46#egg=baselines
+git+https://github.com/openai/baselines.git@98257ef8c9bd23a24a330731ae54ed086d9ce4a7
 cachetools==5.5.2
 certifi==2025.10.5
 charset-normalizer==3.4.4
