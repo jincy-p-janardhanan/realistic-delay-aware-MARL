@@ -14,23 +14,26 @@ from utils.noise import DelayOUNoise
 from algorithms.maddpg import MADDPG
 from tqdm import tqdm 
 
-# FIXED: Proper CUDA detection and initialization
 def setup_cuda():
     """Setup CUDA with proper device selection for Colab"""
     if torch.cuda.is_available():
-        # In Colab, GPU 0 is the default
         device_id = 0
         torch.cuda.set_device(device_id)
-        print(f"CUDA available: {torch.cuda.get_device_name(device_id)}")
-        print(f"CUDA version: {torch.version.cuda}")
-        print(f"Device count: {torch.cuda.device_count()}")
-        print(f"Current device: {torch.cuda.current_device()}")
+        # Enable cuDNN optimizations
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        print(f"✓ CUDA available: {torch.cuda.get_device_name(device_id)}")
+        print(f"✓ CUDA version: {torch.version.cuda}")
+        print(f"✓ Device count: {torch.cuda.device_count()}")
+        print(f"✓ Current device: {torch.cuda.current_device()}")
+        print(f"✓ cuDNN benchmark enabled")
         return True
     else:
         print("✗ CUDA not available, using CPU")
         return False
 
 USE_CUDA = setup_cuda()
+DEVICE = torch.device('cuda' if USE_CUDA else 'cpu')
 
 def make_parallel_env(env_id, n_rollout_threads, seed, discrete_action):
     def get_env_fn(rank):
@@ -60,20 +63,16 @@ def compute_virtual_action(action_buffer, delay_float):
     if delay_float == 0:
         return action_buffer[0]
         
-    I = int(np.floor(delay_float))  # Integer part
-    f = delay_float - I  # Fractional part
+    I = int(np.floor(delay_float))
+    f = delay_float - I
     
     if I >= len(action_buffer):
-        # If delay exceeds buffer, use oldest action
         return action_buffer[-1]
     
     if f == 0:
-        # Pure integral delay
         return action_buffer[I]
     else:
-        # Non-integral delay: interpolate between two actions
         if I + 1 >= len(action_buffer):
-            # If we can't interpolate, use the oldest action
             return action_buffer[-1]
         return (1 - f) * action_buffer[I] + f * action_buffer[I + 1]
 
@@ -97,8 +96,12 @@ def run(config):
 
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-    if not USE_CUDA:
+    if USE_CUDA:
+        torch.cuda.manual_seed(config.seed)
+        torch.cuda.manual_seed_all(config.seed)
+    else:
         torch.set_num_threads(config.n_training_threads)
+    
     env = make_parallel_env(config.env_id, config.n_rollout_threads, config.seed,
                             config.discrete_action)
     
@@ -113,17 +116,13 @@ def run(config):
     print(f"OU sigma: {config.ou_sigma}")
     print(f"Episodes: {config.n_episodes}")
     print(f"Episode length: {config.episode_length}")
-    print(f"Exploration episodes: {config.n_exploration_eps}")
     print(f"Learning rate: {config.lr}")
-    print(f"Gamma: {config.gamma}")
     print(f"Hidden dim: {config.hidden_dim}")
     print(f"Batch size: {config.batch_size}")
-    print(f"Rollout threads: {config.n_rollout_threads}")
     print("="*60 + "\n")
+    print("\n[DEBUG] ========== INITIALIZING MADDPG ==========")
     
-    # Calculate buffer size needed based on max_delay
     delay_buffer_size = int(np.ceil(config.max_delay)) + 1
-    print(f"[INFO] Delay buffer size: {delay_buffer_size}")
     
     maddpg = MADDPG.init_from_env_with_delay(
         env, 
@@ -132,32 +131,29 @@ def run(config):
         tau=config.tau,
         lr=config.lr,
         hidden_dim=config.hidden_dim,
-        gamma=config.gamma,
         min_delay=config.min_delay,
         max_delay=config.max_delay,
         use_sigmoid=True
     )
     
-    # Initialize OU noise processes for each environment and agent
-    # Mean is set to midpoint of delay range
     delay_mean = (config.min_delay + config.max_delay) / 2.0
     ou_processes = []
     for env_idx in range(config.n_rollout_threads):
-        env_ou_list = []
-        for agent_idx in range(maddpg.nagents):
-            ou = OUNoise(
-                mu=delay_mean,
+        env_ou_list = [
+            DelayOUNoise(
+                config.min_delay,
+                config.max_delay,
                 theta=config.ou_theta,
-                sigma=config.ou_sigma,
-                x0=delay_mean
+                sigma=config.ou_sigma
             )
-            env_ou_list.append(ou)
+            for _ in range(maddpg.nagents)
+        ]
         ou_processes.append(env_ou_list)
     
     for i, agent in enumerate(maddpg.agents):
-        print(f"[INFO] Agent {i} policy input dim: {agent.policy.fc1.in_features}")
+        print(f"[INFO] Agent {i} policy input dim: {agent.policy.in_fn.num_features}")
+        print(f"[INFO] Agent {i} max delay_step: {config.max_delay}")
     
-    # Calculate observation dimension for replay buffer
     replay_buffer = ReplayBuffer(
         config.buffer_length, 
         maddpg.nagents,
@@ -171,23 +167,20 @@ def run(config):
     pbar = tqdm(range(0, config.n_episodes, config.n_rollout_threads),
                 desc="Training progress", dynamic_ncols=True)
     
-    # Storage for delay statistics
     all_delays = []
+    
+    # Pre-compute device string for efficiency
+    device_str = 'gpu' if USE_CUDA else 'cpu'
     
     for ep_i in pbar:
         obs = env.reset()
         
-        # FIXED: Proper device switching
-        if USE_CUDA:
-            maddpg.prep_rollouts(device='gpu')
-        else:
-            maddpg.prep_rollouts(device='cpu')
+        maddpg.prep_rollouts(device=device_str)
 
         explr_pct_remaining = max(0, config.n_exploration_eps - ep_i) / config.n_exploration_eps
         maddpg.scale_noise(config.final_noise_scale + (config.init_noise_scale - config.final_noise_scale) * explr_pct_remaining)
         maddpg.reset_noise()
 
-        # Initialize action buffers for each environment
         last_agent_actions = []
         for env_idx in range(config.n_rollout_threads):
             env_agent_buffers = []
@@ -197,12 +190,10 @@ def run(config):
                 env_agent_buffers.append(zero_actions)
             last_agent_actions.append(env_agent_buffers)
         
-        # Reset OU processes at episode start
         for env_ou_list in ou_processes:
             for ou in env_ou_list:
                 ou.reset()
         
-        # Append action history to observations for ALL environments
         for env_idx in range(config.n_rollout_threads):
             for a_i in range(len(obs[env_idx])):
                 agent_obs = obs[env_idx][a_i]
@@ -210,23 +201,27 @@ def run(config):
                     agent_obs = np.append(agent_obs, last_agent_actions[env_idx][a_i][action_idx])
                 obs[env_idx, a_i] = agent_obs
         
-        episode_delays = []  # Track delays for this episode
+        episode_delays = []
         
         for et_i in range(config.episode_length):
-            # Get observations for all agents
-            torch_obs = [Variable(torch.Tensor(np.vstack(obs[:, i])),
-                                  requires_grad=False)
-                         for i in range(maddpg.nagents)]
+            # Optimized: Create tensors with pin_memory and non_blocking transfer
+            torch_obs = []
+            for i in range(maddpg.nagents):
+                obs_data = torch.from_numpy(np.vstack(obs[:, i])).float()
+                if USE_CUDA:
+                    # Use pinned memory for faster GPU transfer
+                    obs_data = obs_data.pin_memory().to(DEVICE, non_blocking=True)
+                torch_obs.append(Variable(obs_data, requires_grad=False))
             
-            # FIXED: Move observations to GPU if using CUDA
-            if USE_CUDA:
-                torch_obs = [obs.cuda() for obs in torch_obs]
-            
-            # Get actions from policies
             torch_agent_actions = maddpg.step(torch_obs, explore=True)
-            agent_actions = [ac.data.cpu().numpy().astype(np.float32) for ac in torch_agent_actions]
+            
+            # Optimized: Efficient CPU transfer
+            if USE_CUDA:
+                agent_actions = [ac.data.cpu().numpy().astype(np.float32) for ac in torch_agent_actions]
+            else:
+                agent_actions = [ac.data.numpy().astype(np.float32) for ac in torch_agent_actions]
 
-            # Clip actions
+            # Clip actions to valid action space range
             for a_i in range(len(agent_actions)):
                 low = env.action_space[a_i].low
                 high = env.action_space[a_i].high
@@ -236,16 +231,12 @@ def run(config):
             step_delays = []
             
             for env_idx in range(config.n_rollout_threads):
-                # Get current actions for this environment
                 current_actions = [agent_actions[a_i][env_idx] for a_i in range(maddpg.nagents)]
                 
-                # Compute virtual effective actions using OU-generated delays
                 env_actions = []
                 env_step_delays = []
                 for agent_idx in range(maddpg.nagents):
-                    # Sample delay from OU process
                     raw_delay = ou_processes[env_idx][agent_idx].sample()
-                    # Clip to [min_delay, max_delay]
                     current_delay = np.clip(raw_delay, config.min_delay, config.max_delay)
                     env_step_delays.append(current_delay)
                     
@@ -253,14 +244,12 @@ def run(config):
                         last_agent_actions[env_idx][agent_idx], 
                         current_delay
                     )
-                    # Clip to valid action range
                     low, high = env.action_space[agent_idx].low, env.action_space[agent_idx].high
                     virtual_action = np.clip(virtual_action, low, high).astype(np.float32)
                     env_actions.append(virtual_action)
                 
                 step_delays.append(env_step_delays)
                 
-                # Update action buffers: shift and add new action
                 for agent_idx in range(maddpg.nagents):
                     last_agent_actions[env_idx][agent_idx].pop()
                     last_agent_actions[env_idx][agent_idx].insert(0, current_actions[agent_idx])
@@ -269,10 +258,8 @@ def run(config):
             
             episode_delays.append(step_delays)
             
-            # Step environment with virtual effective actions
             next_obs, rewards, dones, infos = env.step(actions)
             
-            # Append action history to next observations
             for env_idx in range(config.n_rollout_threads):
                 for a_i in range(len(next_obs[env_idx])):
                     agent_obs = next_obs[env_idx][a_i]
@@ -280,44 +267,34 @@ def run(config):
                         agent_obs = np.append(agent_obs, last_agent_actions[env_idx][a_i][action_idx])
                     next_obs[env_idx, a_i] = agent_obs
             
-            # FIXED: Collect virtual actions and push ONCE (removed duplicate)
-            virtual_actions_per_agent = []
-            for agent_idx in range(maddpg.nagents):
-                # Collect virtual actions across all parallel environments
-                agent_virtual_actions = np.array([actions[env_idx][agent_idx] 
-                                                for env_idx in range(config.n_rollout_threads)])
-                virtual_actions_per_agent.append(agent_virtual_actions)
-
-            # Store virtual actions (what actually executed) - ONLY ONCE!
-            replay_buffer.push(obs, virtual_actions_per_agent, rewards, next_obs, dones)
+            replay_buffer.push(obs, agent_actions, rewards, next_obs, dones)
             
             obs = next_obs
             t += config.n_rollout_threads
             
             if (len(replay_buffer) >= config.batch_size and
                 (t % config.steps_per_update) < config.n_rollout_threads):
+                
+                maddpg.prep_training(device=device_str)
+                
+                # Optimized: Synchronize before training to ensure all data is ready
                 if USE_CUDA:
-                    maddpg.prep_training(device='gpu')
-                else:
-                    maddpg.prep_training(device='cpu')
+                    torch.cuda.synchronize()
                 
-                # Sample once, use for all agents
-                sample = replay_buffer.sample(config.batch_size, to_gpu=USE_CUDA)
+                for u_i in range(config.n_rollout_threads):
+                    for a_i in range(maddpg.nagents - 1):
+                        sample = replay_buffer.sample(config.batch_size,
+                                                      to_gpu=USE_CUDA)
+                        maddpg.update(sample, a_i, logger=logger)
+                    maddpg.update_adversaries()
                 
-                # Update all agents (excluding runner if nagents > 3)
-                for a_i in range(maddpg.nagents):
-                    maddpg.update(sample, a_i, logger=logger)
-                
-                # Update all target networks
-                maddpg.update_all_targets()
-                
+                # Optimized: Synchronize after training before switching back to rollout
                 if USE_CUDA:
-                    maddpg.prep_rollouts(device='gpu')
-                else:
-                    maddpg.prep_rollouts(device='cpu')
+                    torch.cuda.synchronize()
+                
+                maddpg.prep_rollouts(device=device_str)
         
-        # Compute delay statistics for this episode
-        episode_delays = np.array(episode_delays)  # shape: (episode_length, n_envs, n_agents)
+        episode_delays = np.array(episode_delays)
         mean_delay = np.mean(episode_delays)
         std_delay = np.std(episode_delays)
         all_delays.extend(episode_delays.flatten())
@@ -325,7 +302,6 @@ def run(config):
         ep_rews = replay_buffer.get_average_rewards(
             config.episode_length * config.n_rollout_threads)
         
-        # Log & update progress bar
         reward_str = " | ".join([f"A{i}: {a_ep_rew:.2f}" for i, a_ep_rew in enumerate(ep_rews)])
         delay_str = f"Delay: {mean_delay:.2f}±{std_delay:.2f}"
         pbar.set_description(f"Ep {ep_i + 1}/{config.n_episodes} [{reward_str}] {delay_str}")
@@ -333,7 +309,6 @@ def run(config):
         for a_i, a_ep_rew in enumerate(ep_rews):
             logger.add_scalars('agent%i/mean_episode_rewards' % a_i, {'reward': a_ep_rew}, ep_i)
         
-        # Log delay statistics
         logger.add_scalar('delays/mean', mean_delay, ep_i)
         logger.add_scalar('delays/std', std_delay, ep_i)
         logger.add_scalar('delays/min', np.min(episode_delays), ep_i)
@@ -347,7 +322,6 @@ def run(config):
     maddpg.save(run_dir / 'model.pt')
     env.close()
     
-    # Print final delay statistics
     print("\n" + "="*60)
     print("DELAY STATISTICS")
     print("="*60)
@@ -370,23 +344,22 @@ if __name__ == '__main__':
     parser.add_argument("--seed",
                         default=1, type=int,
                         help="Random seed")
-    parser.add_argument("--n_rollout_threads", default=12, type=int)
+    parser.add_argument("--n_rollout_threads", default=1, type=int)
     parser.add_argument("--n_training_threads", default=6, type=int)
     parser.add_argument("--buffer_length", default=int(1e6), type=int)
-    parser.add_argument("--n_episodes", default=40000, type=int)
-    parser.add_argument("--episode_length", default=100, type=int)
+    parser.add_argument("--n_episodes", default=25000, type=int)
+    parser.add_argument("--episode_length", default=25, type=int)
     parser.add_argument("--steps_per_update", default=100, type=int)
     parser.add_argument("--batch_size",
                         default=1024, type=int,
                         help="Batch size for model training")
-    parser.add_argument("--n_exploration_eps", default=12000, type=int)
+    parser.add_argument("--n_exploration_eps", default=25000, type=int)
     parser.add_argument("--init_noise_scale", default=0.3, type=float)
     parser.add_argument("--final_noise_scale", default=0.0, type=float)
     parser.add_argument("--save_interval", default=1000, type=int)
-    parser.add_argument("--hidden_dim", default=256, type=int)
-    parser.add_argument("--lr", default=0.0001, type=float)
+    parser.add_argument("--hidden_dim", default=64, type=int)
+    parser.add_argument("--lr", default=0.01, type=float)
     parser.add_argument("--tau", default=0.01, type=float)
-    parser.add_argument("--gamma", default=0.95, type=float)
     parser.add_argument("--agent_alg",
                         default="MADDPG", type=str,
                         choices=['MADDPG', 'DDPG'])
