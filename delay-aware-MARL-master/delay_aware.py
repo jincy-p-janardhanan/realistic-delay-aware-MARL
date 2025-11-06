@@ -10,9 +10,11 @@ from tensorboardX import SummaryWriter
 from utils.make_env import make_env
 from utils.buffer import ReplayBuffer
 from utils.env_wrappers import SubprocVecEnv, DummyVecEnv
+from utils.noise import DelayOUNoise
 from algorithms.maddpg import MADDPG
+from tqdm import tqdm 
 
-USE_CUDA = True  # torch.cuda.is_available()
+USE_CUDA = False  # torch.cuda.is_available()
 
 # Force CUDA initialization early
 if torch.cuda.is_available():
@@ -22,6 +24,37 @@ else:
     print(" No CUDA available, using CPU")
 import os
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
+
+
+class OUNoise:
+    """Ornstein-Uhlenbeck process for generating temporally correlated noise."""
+    def __init__(self, mu=0.0, theta=0.15, sigma=0.2, dt=1.0, x0=None):
+        """
+        Args:
+            mu: Mean/equilibrium value
+            theta: Mean reversion rate (higher = faster return to mean)
+            sigma: Volatility/noise scale
+            dt: Time step
+            x0: Initial value (defaults to mu)
+        """
+        self.mu = mu
+        self.theta = theta
+        self.sigma = sigma
+        self.dt = dt
+        self.x0 = x0 if x0 is not None else mu
+        self.reset()
+    
+    def reset(self):
+        """Reset the process to initial state."""
+        self.x = self.x0
+    
+    def sample(self):
+        """Generate next sample from the OU process."""
+        dx = self.theta * (self.mu - self.x) * self.dt + \
+             self.sigma * np.sqrt(self.dt) * np.random.randn()
+        self.x = self.x + dx
+        return self.x
+
 
 def make_parallel_env(env_id, n_rollout_threads, seed, discrete_action):
     def get_env_fn(rank):
@@ -35,6 +68,7 @@ def make_parallel_env(env_id, n_rollout_threads, seed, discrete_action):
         return DummyVecEnv([get_env_fn(0)])
     else:
         return SubprocVecEnv([get_env_fn(i) for i in range(n_rollout_threads)])
+
 
 def compute_virtual_action(action_buffer, delay_float):
     """
@@ -53,14 +87,20 @@ def compute_virtual_action(action_buffer, delay_float):
     I = int(np.floor(delay_float))  # Integer part
     f = delay_float - I  # Fractional part
     
+    if I >= len(action_buffer):
+        # If delay exceeds buffer, use oldest action
+        return action_buffer[-1]
+    
     if f == 0:
         # Pure integral delay
         return action_buffer[I]
     else:
         # Non-integral delay: interpolate between two actions
-        # action_buffer[I] is the action I steps ago
-        # action_buffer[I+1] is the action I+1 steps ago
+        if I + 1 >= len(action_buffer):
+            # If we can't interpolate, use the oldest action
+            return action_buffer[-1]
         return (1 - f) * action_buffer[I] + f * action_buffer[I + 1]
+
 
 def run(config):
     model_dir = Path('./models') / config.env_id / config.model_name
@@ -85,23 +125,28 @@ def run(config):
         torch.set_num_threads(config.n_training_threads)
     env = make_parallel_env(config.env_id, config.n_rollout_threads, config.seed,
                             config.discrete_action)
+    
     print("\n" + "="*60)
     print("TRAINING CONFIGURATION")
     print("="*60)
     print(f"Environment: {config.env_id}")
-    print(f"Delay step: {config.delay_step}")
+    print(f"Min delay: {config.min_delay}")
+    print(f"Max delay: {config.max_delay}")
+    print(f"OU theta: {config.ou_theta}")
+    print(f"OU sigma: {config.ou_sigma}")
     print(f"Episodes: {config.n_episodes}")
     print(f"Episode length: {config.episode_length}")
     print(f"Learning rate: {config.lr}")
     print(f"Hidden dim: {config.hidden_dim}")
     print(f"Batch size: {config.batch_size}")
-    if config.delay_step == 0:
-        print("⚠️  DELAY-UNAWARE MODE (delay_step=0)")
     print("="*60 + "\n")
     print("\n[DEBUG] ========== INITIALIZING MADDPG ==========")
     
-    # Calculate buffer size needed (ceiling of delay)
-    delay_buffer_size = int(np.ceil(config.delay_step)) + 1
+    # Calculate buffer size needed based on max_delay
+    delay_buffer_size = int(np.ceil(config.max_delay)) + 1
+    
+    # Calculate buffer size needed based on max_delay (BEFORE MADDPG init)
+    delay_buffer_size = int(np.ceil(config.max_delay)) + 1
     
     maddpg = MADDPG.init_from_env_with_delay(
         env, 
@@ -110,17 +155,32 @@ def run(config):
         tau=config.tau,
         lr=config.lr,
         hidden_dim=config.hidden_dim,
-        delay_step=config.delay_step,
+        min_delay=config.min_delay,
+        max_delay=config.max_delay,
         use_sigmoid=True
     )
     
-    print(f"[DEBUG] MADDPG initialized with {maddpg.nagents} agents")
-    print(f"[DEBUG] Delay buffer size: {delay_buffer_size}")
+    # Initialize OU noise processes for each environment and agent
+    # Mean is set to midpoint of delay range
+    delay_mean = (config.min_delay + config.max_delay) / 2.0
+    ou_processes = []
+    for env_idx in range(config.n_rollout_threads):
+        env_ou_list = []
+        for agent_idx in range(maddpg.nagents):  # Now we know nagents
+            ou = OUNoise(
+                mu=delay_mean,
+                theta=config.ou_theta,
+                sigma=config.ou_sigma,
+                x0=delay_mean
+            )
+            env_ou_list.append(ou)
+        ou_processes.append(env_ou_list)
+    
     for i, agent in enumerate(maddpg.agents):
         print(f"[INFO] Agent {i} policy input dim: {agent.policy.in_fn.num_features}")
-        print(f"[INFO] Agent {i} delay_step: {agent.delay_step}")
+        print(f"[INFO] Agent {i} max delay_step: {config.max_delay}")
+    
     # Calculate observation dimension for replay buffer
-    # Each agent sees: original_obs + delay_buffer_size * action_dim
     replay_buffer = ReplayBuffer(
         config.buffer_length, 
         maddpg.nagents,
@@ -131,16 +191,14 @@ def run(config):
     )
     
     t = 0
-    for ep_i in range(0, config.n_episodes, config.n_rollout_threads):
-        print("Episodes %i-%i of %i" % (ep_i + 1,
-                                        ep_i + 1 + config.n_rollout_threads,
-                                        config.n_episodes))
-        
+    pbar = tqdm(range(0, config.n_episodes, config.n_rollout_threads),
+                desc="Training progress", dynamic_ncols=True)
+    
+    # Storage for delay statistics
+    all_delays = []
+    
+    for ep_i in pbar:
         obs = env.reset()
-        
-        print(f"[DEBUG] After reset, obs shape: {obs.shape}")
-        for i, o in enumerate(obs[0]):
-            print(f"[DEBUG] obs[0][{i}] shape: {o.shape}, dtype: {o.dtype}")
         
         if USE_CUDA:
             maddpg.prep_rollouts(device='gpu')
@@ -152,31 +210,29 @@ def run(config):
         maddpg.reset_noise()
 
         # Initialize action buffers for each environment
-        # Structure: last_agent_actions[env_idx][agent_idx] = [newest, ..., oldest]
         last_agent_actions = []
         for env_idx in range(config.n_rollout_threads):
             env_agent_buffers = []
             for agent_idx in range(maddpg.nagents):
-                # Initialize with zeros, size = delay_buffer_size
                 zero_actions = [np.zeros(env.action_space[agent_idx].shape[0]) 
                                for _ in range(delay_buffer_size)]
                 env_agent_buffers.append(zero_actions)
             last_agent_actions.append(env_agent_buffers)
         
-        print(f"[DEBUG] Action buffer initialized with size {delay_buffer_size} for each agent")
+        # Reset OU processes at episode start
+        for env_ou_list in ou_processes:
+            for ou in env_ou_list:
+                ou.reset()
         
         # Append action history to observations for ALL environments
         for env_idx in range(config.n_rollout_threads):
             for a_i in range(len(obs[env_idx])):
                 agent_obs = obs[env_idx][a_i]
-                # Append all actions in buffer (from newest to oldest)
                 for action_idx in range(delay_buffer_size):
                     agent_obs = np.append(agent_obs, last_agent_actions[env_idx][a_i][action_idx])
                 obs[env_idx, a_i] = agent_obs
         
-        print(f"[DEBUG] After appending action history:")
-        for env_idx in range(min(2, config.n_rollout_threads)):
-            print(f"[DEBUG]   Env {env_idx}: agent shapes = {[obs[env_idx][a].shape for a in range(len(obs[env_idx]))]}")
+        episode_delays = []  # Track delays for this episode
         
         for et_i in range(config.episode_length):
             # Get observations for all agents
@@ -186,50 +242,50 @@ def run(config):
             
             # Get actions from policies
             torch_agent_actions = maddpg.step(torch_obs, explore=True)
-            #agent_actions = [ac.data.numpy() for ac in torch_agent_actions]
-            #agent_actions = [ac.data.cpu().numpy() for ac in torch_agent_actions]
             agent_actions = [ac.data.cpu().numpy().astype(np.float32) for ac in torch_agent_actions]
 
-            #agent_actions = []
-            #for ac in torch_agent_actions:
-             #   if isinstance(ac, torch.Tensor):
-              #      agent_actions.append(ac.detach().cpu().numpy())
-               # elif isinstance(ac, np.ndarray):
-                #    agent_actions.append(ac)
-                #else:
-                    # It's a memoryview or similar - convert to numpy
-                 #   agent_actions.append(np.array(ac, dtype=np.float32))
-            # Prepare actions for each environment
-            for a_i, action in enumerate(agent_actions):
-                print(f"[DEBUG] Agent {a_i} action dtype: {action.dtype}, shape: {action.shape}")
-                print(f"[DEBUG] Agent {a_i} action range: [{action.min():.6f}, {action.max():.6f}]")
-                assert action.dtype == np.float32, f"Agent {a_i} wrong dtype: {action.dtype}"
-            epsilon = 1e-6
+            # Clip actions
             for a_i in range(len(agent_actions)):
-                # Clip to (epsilon, 1-epsilon) and ensure float32
-                agent_actions[a_i] = np.clip(agent_actions[a_i], epsilon, 1.0 - epsilon).astype(np.float32)
+                low = env.action_space[a_i].low
+                high = env.action_space[a_i].high
+                agent_actions[a_i] = np.clip(agent_actions[a_i], low, high).astype(np.float32)
+            
             actions = []
+            step_delays = []
+            
             for env_idx in range(config.n_rollout_threads):
                 # Get current actions for this environment
                 current_actions = [agent_actions[a_i][env_idx] for a_i in range(maddpg.nagents)]
                 
-                # Compute virtual effective actions using the delay
+                # Compute virtual effective actions using OU-generated delays
                 env_actions = []
+                env_step_delays = []
                 for agent_idx in range(maddpg.nagents):
+                    # Sample delay from OU process
+                    raw_delay = ou_processes[env_idx][agent_idx].sample()
+                    # Clip to [min_delay, max_delay]
+                    current_delay = np.clip(raw_delay, config.min_delay, config.max_delay)
+                    env_step_delays.append(current_delay)
+                    
                     virtual_action = compute_virtual_action(
                         last_agent_actions[env_idx][agent_idx], 
-                        config.delay_step
+                        current_delay
                     )
+                    # Clip to valid action range
+                    low, high = env.action_space[agent_idx].low, env.action_space[agent_idx].high
+                    virtual_action = np.clip(virtual_action, low, high).astype(np.float32)
                     env_actions.append(virtual_action)
+                
+                step_delays.append(env_step_delays)
                 
                 # Update action buffers: shift and add new action
                 for agent_idx in range(maddpg.nagents):
-                    # Remove oldest action
                     last_agent_actions[env_idx][agent_idx].pop()
-                    # Add newest action at the beginning
                     last_agent_actions[env_idx][agent_idx].insert(0, current_actions[agent_idx])
                 
                 actions.append(env_actions)
+            
+            episode_delays.append(step_delays)
             
             # Step environment with virtual effective actions
             next_obs, rewards, dones, infos = env.step(actions)
@@ -238,11 +294,21 @@ def run(config):
             for env_idx in range(config.n_rollout_threads):
                 for a_i in range(len(next_obs[env_idx])):
                     agent_obs = next_obs[env_idx][a_i]
-                    # Append all actions in buffer
                     for action_idx in range(delay_buffer_size):
                         agent_obs = np.append(agent_obs, last_agent_actions[env_idx][a_i][action_idx])
                     next_obs[env_idx, a_i] = agent_obs
             
+            # After you compute virtual actions for all agents
+            virtual_actions_per_agent = []
+            for agent_idx in range(maddpg.nagents):
+                # Collect virtual actions across all parallel environments
+                agent_virtual_actions = np.array([actions[env_idx][agent_idx] 
+                                                for env_idx in range(config.n_rollout_threads)])
+                virtual_actions_per_agent.append(agent_virtual_actions)
+
+            # Store virtual actions (what actually executed)
+            replay_buffer.push(obs, virtual_actions_per_agent, rewards, next_obs, dones)
+
             replay_buffer.push(obs, agent_actions, rewards, next_obs, dones)
             
             obs = next_obs
@@ -254,22 +320,39 @@ def run(config):
                     maddpg.prep_training(device='gpu')
                 else:
                     maddpg.prep_training(device='cpu')
-                for u_i in range(config.n_rollout_threads):
-                    for a_i in range(maddpg.nagents - 1):  # do not update the runner
-                        sample = replay_buffer.sample(config.batch_size,
-                                                      to_gpu=USE_CUDA)
-                        maddpg.update(sample, a_i, logger=logger)
-                    maddpg.update_adversaries()
+                # for u_i in range(config.n_rollout_threads):
+                sample = replay_buffer.sample(config.batch_size,
+                                                    to_gpu=USE_CUDA)
+                for a_i in range(maddpg.nagents - 1):  # do not update the runner
+                    maddpg.update(sample, a_i, logger=logger)
+                maddpg.update_all_targets()
                 if USE_CUDA:
                     maddpg.prep_rollouts(device='gpu')
                 else:
                     maddpg.prep_rollouts(device='cpu')
         
+        # Compute delay statistics for this episode
+        episode_delays = np.array(episode_delays)  # shape: (episode_length, n_envs, n_agents)
+        mean_delay = np.mean(episode_delays)
+        std_delay = np.std(episode_delays)
+        all_delays.extend(episode_delays.flatten())
+        
         ep_rews = replay_buffer.get_average_rewards(
             config.episode_length * config.n_rollout_threads)
+        
+        # Log & update progress bar
+        reward_str = " | ".join([f"A{i}: {a_ep_rew:.2f}" for i, a_ep_rew in enumerate(ep_rews)])
+        delay_str = f"Delay: {mean_delay:.2f}±{std_delay:.2f}"
+        pbar.set_description(f"Ep {ep_i + 1}/{config.n_episodes} [{reward_str}] {delay_str}")
+        
         for a_i, a_ep_rew in enumerate(ep_rews):
-            print(f"Episode {ep_i+1}, Agent {a_i} total reward: {a_ep_rew}")
             logger.add_scalars('agent%i/mean_episode_rewards' % a_i, {'reward': a_ep_rew}, ep_i)
+        
+        # Log delay statistics
+        logger.add_scalar('delays/mean', mean_delay, ep_i)
+        logger.add_scalar('delays/std', std_delay, ep_i)
+        logger.add_scalar('delays/min', np.min(episode_delays), ep_i)
+        logger.add_scalar('delays/max', np.max(episode_delays), ep_i)
 
         if ep_i % config.save_interval < config.n_rollout_threads:
             os.makedirs(run_dir / 'incremental', exist_ok=True)
@@ -278,6 +361,17 @@ def run(config):
 
     maddpg.save(run_dir / 'model.pt')
     env.close()
+    
+    # Print final delay statistics
+    print("\n" + "="*60)
+    print("DELAY STATISTICS")
+    print("="*60)
+    print(f"Mean delay: {np.mean(all_delays):.3f}")
+    print(f"Std delay: {np.std(all_delays):.3f}")
+    print(f"Min delay: {np.min(all_delays):.3f}")
+    print(f"Max delay: {np.max(all_delays):.3f}")
+    print("="*60 + "\n")
+    
     logger.export_scalars_to_json(str(log_dir / 'summary.json'))
     logger.close()
 
@@ -300,7 +394,7 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size",
                         default=1024, type=int,
                         help="Batch size for model training")
-    parser.add_argument("--n_exploration_eps", default=25000, type=int)
+    parser.add_argument("--n_exploration_eps", default=3000, type=int)
     parser.add_argument("--init_noise_scale", default=0.3, type=float)
     parser.add_argument("--final_noise_scale", default=0.0, type=float)
     parser.add_argument("--save_interval", default=1000, type=int)
@@ -315,9 +409,18 @@ if __name__ == '__main__':
                         choices=['MADDPG', 'DDPG'])
     parser.add_argument("--discrete_action",
                         action='store_true')
-    parser.add_argument("--delay_step", 
-                        default=3.0, type=float,
-                        help="Delay in time steps (can be non-integral, e.g., 2.5)")
+    parser.add_argument("--min_delay", 
+                        default=2.0, type=float,
+                        help="Minimum delay in time steps")
+    parser.add_argument("--max_delay", 
+                        default=4.0, type=float,
+                        help="Maximum delay in time steps")
+    parser.add_argument("--ou_theta",
+                        default=0.15, type=float,
+                        help="OU process mean reversion rate (higher = faster return to mean)")
+    parser.add_argument("--ou_sigma",
+                        default=0.3, type=float,
+                        help="OU process volatility/noise scale")
 
     config = parser.parse_args()
 

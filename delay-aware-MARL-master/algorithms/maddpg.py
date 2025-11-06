@@ -13,8 +13,8 @@ class MADDPG(object):
     Wrapper class for DDPG-esque (i.e. also MADDPG) agents in multi-agent task
     """
     def __init__(self, agent_init_params, alg_types,
-                 gamma=0.99, tau=0.01, lr=0.01, hidden_dim=64,
-                 discrete_action=False, use_sigmoid=False, delay_step=3.0):
+                 gamma=0.95, tau=0.01, lr=0.01, hidden_dim=64,
+                 discrete_action=False, use_sigmoid=False, min_delay=2.0, max_delay=4.0):
         """
         Inputs:
             agent_init_params (list of dict): List of dicts with parameters to
@@ -30,11 +30,14 @@ class MADDPG(object):
             hidden_dim (int): Number of hidden dimensions for networks
             discrete_action (bool): Whether or not to use discrete action space
             use_sigmoid (bool): Use sigmoid activation for continuous actions ([0,1] range)
+            min_delay (float): Minimum delay in time steps
+            max_delay (float): Maximum delay in time steps
         """
         self.nagents = len(alg_types)
         self.alg_types = alg_types
         self.agents = [DDPGAgent(lr=lr, discrete_action=discrete_action,
-                                 hidden_dim=hidden_dim, use_sigmoid=use_sigmoid, delay_step=delay_step,
+                                 hidden_dim=hidden_dim, use_sigmoid=use_sigmoid, 
+                                 min_delay=min_delay, max_delay=max_delay,
                                  **params)
                        for params in agent_init_params]
         self.agent_init_params = agent_init_params
@@ -48,7 +51,8 @@ class MADDPG(object):
         self.trgt_critic_dev = 'gpu'
         self.niter = 0
         self.use_sigmoid = use_sigmoid
-        self.delay_step = delay_step
+        self.min_delay = min_delay
+        self.max_delay = max_delay
 
     @property
     def policies(self):
@@ -120,6 +124,12 @@ class MADDPG(object):
             vf_in = torch.cat((obs[agent_i], acs[agent_i]), dim=1)
         actual_value = curr_agent.critic(vf_in)
         vf_loss = MSELoss(actual_value, target_value.detach())
+
+        if vf_loss < 0:
+            print(f"[ERROR] Negative vf_loss: {vf_loss.item()}")
+            print(f"  actual_value range: [{actual_value.min()}, {actual_value.max()}]")
+            print(f"  target_value range: [{target_value.min()}, {target_value.max()}]")
+    
         vf_loss.backward()
         if parallel:
             average_gradients(curr_agent.critic)
@@ -229,7 +239,7 @@ class MADDPG(object):
 
     @classmethod
     def init_from_env(cls, env, agent_alg="MADDPG", adversary_alg="MADDPG",
-                      gamma=0.99, tau=0.01, lr=0.01, hidden_dim=64):
+                      gamma=0.95, tau=0.01, lr=0.01, hidden_dim=64):
         """
         Instantiate instance of this class from multi-agent environment
         """
@@ -270,22 +280,25 @@ class MADDPG(object):
     
     @classmethod    
     def init_from_env_with_delay(cls, env, agent_alg="MADDPG", adversary_alg="MADDPG",
-                      gamma=0.95, tau=0.01, lr=0.01, hidden_dim=64, delay_step=3.0, use_sigmoid=True):
+                      gamma=0.95, tau=0.01, lr=0.01, hidden_dim=64, 
+                      min_delay=2.0, max_delay=4.0, use_sigmoid=True):
         """
         Instantiate instance of this class from multi-agent environment with support for
-        non-integral delays.
+        time-varying delays specified by min_delay and max_delay.
         
         Args:
-            delay_step (float): Delay in time steps (can be non-integral, e.g., 2.5)
+            min_delay (float): Minimum delay in time steps
+            max_delay (float): Maximum delay in time steps (used for buffer sizing)
         """
         agent_init_params = []
         alg_types = [adversary_alg if atype == 'adversary' else agent_alg for
                      atype in env.agent_types]
         
-        # Calculate buffer size needed: ceiling of delay + 1
-        delay_buffer_size = int(np.ceil(delay_step)) + 1
+        # Calculate buffer size needed: ceiling of max_delay + 1
+        delay_buffer_size = int(np.ceil(max_delay)) + 1
         
-        print(f"[MADDPG DEBUG] Delay step: {delay_step}")
+        print(f"[MADDPG DEBUG] Min delay: {min_delay}")
+        print(f"[MADDPG DEBUG] Max delay: {max_delay}")
         print(f"[MADDPG DEBUG] Delay buffer size: {delay_buffer_size}")
         
         for acsp, obsp, algtype in zip(env.action_space, env.observation_space,
@@ -300,23 +313,26 @@ class MADDPG(object):
             num_out_pol = get_shape(acsp)
             
             # Policy input: observation + action_history
-            # For non-integral delays, we store ceil(delay)+1 past actions
+            # Buffer size is based on max_delay to handle worst case
             num_in_pol = obsp.shape[0] + delay_buffer_size * num_out_pol
             
             print(f"[MADDPG DEBUG] Agent: obs_dim={obsp.shape[0]}, action_dim={num_out_pol}")
             print(f"[MADDPG DEBUG]   Policy input dim: {num_in_pol} = {obsp.shape[0]} + {delay_buffer_size}*{num_out_pol}")
             
+            # In init_from_env_with_delay:
             if algtype == "MADDPG":
                 num_in_critic = 0
-                # Add all observations
+                # Add all observations (which already include action history)
                 for oobsp in env.observation_space:
                     num_in_critic += oobsp.shape[0]
+                    # Add action history size
+                    action_dim = get_shape(env.action_space[0]) 
+                    num_in_critic += delay_buffer_size * action_dim
                 
-                # Add all actions + their history
+                # Add current actions only (not action history again!)
                 for oacsp in env.action_space:
                     action_dim = get_shape(oacsp)
-                    num_in_critic += action_dim  # Current action
-                    num_in_critic += delay_buffer_size * action_dim  # Action history
+                    num_in_critic += action_dim  # ONLY current action
                 
                 print(f"[MADDPG DEBUG]   Critic input dim (MADDPG): {num_in_critic}")
             else:  # DDPG
@@ -334,7 +350,8 @@ class MADDPG(object):
             'agent_init_params': agent_init_params,
             'discrete_action': discrete_action,
             'use_sigmoid': use_sigmoid,
-            'delay_step': delay_step
+            'min_delay': min_delay,
+            'max_delay': max_delay
         }
         instance = cls(**init_dict)
         instance.init_dict = init_dict
@@ -342,15 +359,16 @@ class MADDPG(object):
     
     @classmethod    
     def init_from_env_with_runner(cls, env, agent_alg="MADDPG", adversary_alg="MADDPG",
-                      gamma=0.99, tau=0.01, lr=0.01, hidden_dim=64, delay_step=0.0, file_name=''):
+                      gamma=0.95, tau=0.01, lr=0.01, hidden_dim=64, 
+                      min_delay=2.0, max_delay=4.0, file_name=''):
         """
-        Instantiate with a pre-trained runner agent (agent 2) for non-integral delays.
+        Instantiate with a pre-trained runner agent (agent 2) for time-varying delays.
         """
         agent_init_params = []
         alg_types = [adversary_alg if atype == 'adversary' else agent_alg for
                      atype in env.agent_types]
         
-        delay_buffer_size = int(np.ceil(delay_step)) + 1
+        delay_buffer_size = int(np.ceil(max_delay)) + 1
         
         for acsp, obsp, algtype, atype in zip(env.action_space, env.observation_space,
                                        alg_types, env.agent_types):
@@ -395,8 +413,9 @@ class MADDPG(object):
             'alg_types': alg_types,
             'agent_init_params': agent_init_params,
             'discrete_action': discrete_action,
-            'use_sigmoid': use_sigmoid,
-            'delay_step': delay_step
+            'use_sigmoid': True,
+            'min_delay': min_delay,
+            'max_delay': max_delay
         }
         instance = cls(**init_dict)
         instance.init_dict = init_dict
@@ -406,7 +425,8 @@ class MADDPG(object):
     
     @classmethod    
     def init_from_env_with_runner_delay_unaware(cls, env, agent_alg="MADDPG", adversary_alg="MADDPG",
-                      gamma=0.99, tau=0.01, lr=0.01, hidden_dim=64, file_name=''):
+                      gamma=0.95, tau=0.01, lr=0.01, hidden_dim=64, 
+                      min_delay=0.0, max_delay=0.0, file_name=''):
         """
         Instantiate with delay-unaware runner (no action history in observations).
         """
@@ -442,8 +462,9 @@ class MADDPG(object):
             'alg_types': alg_types,
             'agent_init_params': agent_init_params,
             'discrete_action': discrete_action,
-            'use_sigmoid': use_sigmoid,
-            'delay_step': delay_step
+            'use_sigmoid': True,
+            'min_delay': min_delay,
+            'max_delay': max_delay
         }
         instance = cls(**init_dict)
         instance.init_dict = init_dict

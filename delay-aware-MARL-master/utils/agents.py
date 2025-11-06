@@ -7,13 +7,17 @@ from .networks import MLPNetwork
 from .misc import hard_update, gumbel_softmax, onehot_from_logits
 from .noise import OUNoise
 import numpy as np
+
 device = 'cuda'
+
 class DDPGAgent(object):
     """
-    Delay-aware wrapper for DDPG with action history observation augmentation
+    Delay-aware wrapper for DDPG with action history observation augmentation.
+    Supports time-varying delays between min_delay and max_delay.
     """
     def __init__(self, num_in_pol, num_out_pol, num_in_critic, hidden_dim=64,
-                 lr=0.01, discrete_action=True, delay_step=3.0, use_sigmoid=True):
+                 lr=0.01, discrete_action=True, delay_step=None, 
+                 min_delay=None, max_delay=None, use_sigmoid=True):
         """
         Inputs:
             num_in_pol (int): number of dimensions for policy input (obs + action_history)
@@ -22,18 +26,34 @@ class DDPGAgent(object):
             hidden_dim (int): number of hidden dimensions
             lr (float): learning rate
             discrete_action (bool): whether action space is discrete
-            delay_step (float): delay in timesteps (can be fractional)
+            delay_step (float): DEPRECATED - use min_delay/max_delay instead
+            min_delay (float): minimum delay in timesteps (can be fractional)
+            max_delay (float): maximum delay in timesteps (can be fractional)
             use_sigmoid (bool): use sigmoid for continuous actions (outputs [0,1])
         """
         self.discrete_action = discrete_action
-        self.delay_step = delay_step
         self.use_sigmoid = use_sigmoid
         
-        print(f"[DelayAwareDDPG] Initializing agent:")
+        # Handle backward compatibility: if delay_step is provided, use it for both min/max
+        if delay_step is not None:
+            self.min_delay = delay_step
+            self.max_delay = delay_step
+            print(f"[DDPGAgent] Using legacy delay_step={delay_step} (both min and max)")
+        elif min_delay is not None and max_delay is not None:
+            self.min_delay = min_delay
+            self.max_delay = max_delay
+        else:
+            # Default values if nothing is specified
+            self.min_delay = 0.0
+            self.max_delay = 0.0
+            print("[DDPGAgent] WARNING: No delay parameters specified, defaulting to 0")
+        
+        print(f"[DDPGAgent] Initializing agent:")
         print(f"  Policy input dim: {num_in_pol}")
         print(f"  Policy output dim: {num_out_pol}")
         print(f"  Critic input dim: {num_in_critic}")
-        print(f"  Delay step: {delay_step}")
+        print(f"  Min delay: {self.min_delay}")
+        print(f"  Max delay: {self.max_delay}")
         print(f"  Use sigmoid: {use_sigmoid}")
         
         # Policy network - uses sigmoid for continuous actions
@@ -118,14 +138,11 @@ class DDPGAgent(object):
                 epsilon = 1e-6
                 action = action.clamp(-1.0 + epsilon, 1.0 - epsilon)
         
-        # Convert to numpy with FLOAT32 (not float64)
-        #if isinstance(action, torch.Tensor):
-         #   action = action.detach().cpu().numpy().astype(np.float32)  # ← CRITICAL: float32
-        
         # EXTRA SAFETY: Ensure strictly within bounds and correct dtype
+        # (This block appears redundant with the above, but kept for compatibility)
         if self.use_sigmoid:
             epsilon = 1e-6
-            action = action.clamp(-1.0 + epsilon, 1.0 - epsilon)
+            action = action.clamp(epsilon, 1.0 - epsilon)
         else:
             epsilon = 1e-6
             action = action.clamp(-1.0 + epsilon, 1.0 - epsilon)
@@ -147,3 +164,17 @@ class DDPGAgent(object):
         self.target_critic.load_state_dict(params['target_critic'])
         self.policy_optimizer.load_state_dict(params['policy_optimizer'])
         self.critic_optimizer.load_state_dict(params['critic_optimizer'])
+    
+    def load_policy_params(self, params):
+        """Load only policy parameters (useful for transfer learning)"""
+        self.policy.load_state_dict(params['policy'])
+        self.target_policy.load_state_dict(params['target_policy'])
+    
+    def get_delay_info(self):
+        """Return delay configuration for this agent"""
+        return {
+            'min_delay': self.min_delay,
+            'max_delay': self.max_delay,
+            'delay_range': self.max_delay - self.min_delay,
+            'mean_delay': (self.min_delay + self.max_delay) / 2.0
+        }

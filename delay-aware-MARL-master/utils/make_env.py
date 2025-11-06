@@ -5,6 +5,7 @@ from pettingzoo.mpe.simple_spread_v3 import parallel_env as ss_env
 from pettingzoo.mpe.simple_reference_v3 import parallel_env as sr_env
 from pettingzoo.mpe.simple_tag_v3 import parallel_env as st_env
 from pettingzoo.mpe.simple_push_v3 import parallel_env as sp_env
+
 class MultiAgentEnvAdapter:
     """
     Adapter to convert PettingZoo parallel env (dict obs/action) to old MPE style list interface
@@ -14,15 +15,15 @@ class MultiAgentEnvAdapter:
         obs_dict, _ = self.env.reset()
         self.agents = list(obs_dict.keys())
         self.n = len(self.agents)
-        print(f"[DEBUG] Agents: {self.agents}, Total: {self.n}")
+        # print(f"[DEBUG] Agents: {self.agents}, Total: {self.n}")
     def reset(self, **kwargs):
         obs_dict, _ = self.env.reset(**kwargs)
         obs_n = [obs_dict[a] for a in self.agents]
         
         # ADD THESE DEBUG PRINTS HERE:
-        print(f"[DEBUG] obs_n types: {[type(o) for o in obs_n]}")
-        print(f"[DEBUG] obs_n shapes: {[o.shape if hasattr(o, 'shape') else 'no shape' for o in obs_n]}")
-        print(f"[DEBUG] obs_n dtypes: {[o.dtype if hasattr(o, 'dtype') else 'no dtype' for o in obs_n]}")
+        # print(f"[DEBUG] obs_n types: {[type(o) for o in obs_n]}")
+        # print(f"[DEBUG] obs_n shapes: {[o.shape if hasattr(o, 'shape') else 'no shape' for o in obs_n]}")
+        # print(f"[DEBUG] obs_n dtypes: {[o.dtype if hasattr(o, 'dtype') else 'no dtype' for o in obs_n]}")
         
         return obs_n
 
@@ -33,8 +34,8 @@ class MultiAgentEnvAdapter:
         """
         # map list -> dict for PettingZoo env
         for i, act in enumerate(action_n):
-            print(f"[DEBUG] Agent {i} action type: {type(act)}, dtype: {act.dtype if hasattr(act, 'dtype') else 'N/A'}")
-            print(f"[DEBUG] Agent {i} action: {act}, min: {act.min()}, max: {act.max()}")
+            # print(f"[DEBUG] Agent {i} action type: {type(act)}, dtype: {act.dtype if hasattr(act, 'dtype') else 'N/A'}")
+            # print(f"[DEBUG] Agent {i} action: {act}, min: {act.min()}, max: {act.max()}")
             
             # Verify bounds
             if hasattr(act, 'min') and hasattr(act, 'max'):
@@ -50,20 +51,36 @@ class MultiAgentEnvAdapter:
 
         return obs_n, reward_n, done_n, info_n
 
-    def render(self, mode='human'):
-        return self.env.render(mode=mode)
+    def render(self):
+        frame = self.env.render()
+        if hasattr(self.env.unwrapped, "viewer") and self.env.unwrapped.viewer is not None:
+            viewer = self.env.unwrapped.viewer
+            if not hasattr(viewer, "_camera_locked"):
+                viewer.set_bounds(-1.5, 1.5, -1.5, 1.5)
+                import types
+                def fixed_render(self, *args, **kwargs):
+                    from pettingzoo.utils import rendering
+                    self._build_geometry()
+                    self._draw_world()
+                    rendering.render_geometry(self.geoms, self.width, self.height)
+                    return self.get_array() if self.render_mode == "rgb_array" else None
+                viewer.render = types.MethodType(fixed_render, viewer)
+                viewer._camera_locked = True
+        return frame
 
     @property
     def action_space(self):
         spaces = [self.env.action_space(a) for a in self.agents]
         for i, sp in enumerate(spaces):
-            print(f"[DEBUG] Agent {self.agents[i]} Action space: {sp}, Type: {type(sp)}")
+            # print(f"[DEBUG] Agent {self.agents[i]} Action space: {sp}, Type: {type(sp)}")
+            pass
         return spaces
     @property
     def observation_space(self):
         spaces = [self.env.observation_space(a) for a in self.agents]
         for i, sp in enumerate(spaces):
-            print(f"[DEBUG] Agent {self.agents[i]} Observation space: {sp}, Type: {type(sp)}")
+            # print(f"[DEBUG] Agent {self.agents[i]} Observation space: {sp}, Type: {type(sp)}")
+            pass
         return spaces
 
 
